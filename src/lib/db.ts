@@ -16,7 +16,19 @@ const databaseUrl =
  * the app has a working database even with nothing configured — the live preview
  * included. Swap in Neon later by just setting `DATABASE_URL`; no code changes.
  */
-export const dbSource: DbSource = databaseUrl ? "neon" : "pglite";
+// Netlify Database (managed Postgres) injects NETLIFY_DB_URL on deployed sites;
+// read through process.env or the Netlify runtime global, whichever is present.
+const netlifyDbUrl = (() => {
+  const fromProcess =
+    typeof process !== "undefined" ? process.env.NETLIFY_DB_URL : undefined;
+  const fromRuntime = (
+    globalThis as { Netlify?: { env?: { get?: (key: string) => string | undefined } } }
+  ).Netlify?.env?.get?.("NETLIFY_DB_URL");
+  const value = fromProcess ?? fromRuntime;
+  return value && value.trim() ? value : undefined;
+})();
+
+export const dbSource: DbSource = databaseUrl || netlifyDbUrl ? "neon" : "pglite";
 
 /**
  * Minimal shared SQL surface, satisfied by both Neon and PGLite. Both the
@@ -89,13 +101,27 @@ function createNeonSql(): Promise<Sql> {
   globalRef.__pgSqlPromise__ ??= (async () => {
     // Regular Postgres driver: node-postgres (`pg`) — works directly with Neon's
     // pooled endpoint. One pool per process; warm serverless instances reuse it.
-    const { Pool, types } = await import("pg");
-    types.setTypeParser(OID_INT8, Number);
-    types.setTypeParser(OID_DATE, identity);
-    types.setTypeParser(OID_INTERVAL, identity);
-    const pool = new Pool({ connectionString: databaseUrl });
-    return toSql(async <T>(text: string, params: unknown[]) => {
-      const res = await pool.query(text, params);
+    // On Netlify (no explicit DATABASE_URL) the pool comes from
+    // `@netlify/database`, which picks the right driver for the platform.
+    const { types } = await import("pg");
+    // Per-query parsers, so they apply to both pg and the Neon serverless pool.
+    const queryTypes = {
+      getTypeParser: (oid: number, format?: "text" | "binary") => {
+        if (oid === OID_INT8) return Number;
+        if (oid === OID_DATE || oid === OID_INTERVAL) return identity;
+        return types.getTypeParser(oid, format as "text");
+      },
+    };
+    let pool: { query: (config: object) => Promise<{ rows: unknown[] }> };
+    if (databaseUrl) {
+      const { Pool } = await import("pg");
+      pool = new Pool({ connectionString: databaseUrl });
+    } else {
+      const { getDatabase } = await import("@netlify/database");
+      pool = getDatabase({ connectionString: netlifyDbUrl }).pool as unknown as typeof pool;
+    }
+    return toSql(async <T>(text: string, values: unknown[]) => {
+      const res = await pool.query({ text, values, types: queryTypes });
       return res.rows as T[];
     });
   })().catch((err) => {
@@ -129,7 +155,8 @@ async function createPgliteSql(): Promise<Sql> {
   });
   const pg = await globalRef.__pgliteInstance__;
 
-  // Apply migrations/ (the single schema source) so preview matches production.
+  // Apply netlify/database/migrations/ (the single schema source; Netlify
+  // applies the same files to the deployed database) so preview matches production.
   // SQL is inlined by the bundler via import.meta.glob (no runtime fs); applied
   // files are tracked in _migrations. The glob does not descend, so the opt-in
   // auth schema under migrations/auth/ stays out. Runs once per module instance
@@ -137,7 +164,7 @@ async function createPgliteSql(): Promise<Sql> {
   // passes serialized on a global chain so concurrent callers never
   // double-apply.
   const migrate = async (): Promise<void> => {
-    const migrations = import.meta.glob("/migrations/*.sql", {
+    const migrations = import.meta.glob("/netlify/database/migrations/*.sql", {
       query: "?raw",
       import: "default",
       eager: true,
@@ -183,7 +210,7 @@ async function createSql(): Promise<Sql> {
  * Get the shared, **server-only** SQL client. Neon when `DATABASE_URL` is set,
  * otherwise the local PGLite fallback. Memoized — safe to call per request.
  *
- * Schema comes from `migrations/*.sql`, auto-applied before the first query on
+ * Schema comes from `netlify/database/migrations/*.sql`, auto-applied before the first query on
  * both backends — define tables there, never inline in server functions.
  */
 export function getSql(): Promise<Sql> {
@@ -195,7 +222,7 @@ export function getSql(): Promise<Sql> {
 }
 
 /**
- * The shared PGLite instance (preview only), with `migrations/*.sql` applied.
+ * The shared PGLite instance (preview only), with `netlify/database/migrations/*.sql` applied.
  * Lets Better Auth persist to the SAME embedded DB as app data in preview (via a
  * Kysely dialect). Throws when `DATABASE_URL` is set (that path uses Neon).
  */
@@ -213,7 +240,7 @@ export async function getPglite(): Promise<import("@electric-sql/pglite").PGlite
  * Finish DB bootstrap before the server handles traffic.
  *
  * - **PGLite** (preview / no `DATABASE_URL`): open the in-memory DB and apply
- *   `migrations/*.sql`. Idempotent — concurrent callers share one promise.
+ *   `netlify/database/migrations/*.sql`. Idempotent — concurrent callers share one promise.
  * - **Neon**: no-op (pool is created lazily on first query).
  *
  * Vite `configureServer` awaits this at dev startup; production imports of this
