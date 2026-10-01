@@ -1,0 +1,43 @@
+# Java / Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.log
+hs_err_pid*
+
+# Maven wrapper jar is committed; local repo is not
+.mvn/wrapper/maven-wrapper.jar.download
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.vscode/
+*.swp
+*.swo
+
+# Node / Vite
+node_modules/
+dist/
+frontend/dist/
+frontend/.vite/
+*.local
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.tmp
+*.bak
